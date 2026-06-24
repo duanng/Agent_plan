@@ -138,6 +138,19 @@
 |L3|退款、赔付、补发、权限修改、生产变更|强制人工审批|
 |L4|不可逆或高风险操作|不向 Agent 开放|
 
+### 2.7 编译知识优先于即时检索
+
+传统 RAG 在每次查询时从原始文档块中即时检索——知识在查询后消散，不产生累积效应。LLM Wiki 范式提出了一种互补策略：**在摄入阶段将原始文档增量编译成结构化、互相链接的持久化知识页面**，查询时优先遍历已编译的知识图谱，仅在必要时回退到原始块检索。
+
+具体而言：
+
+- **稳定知识走编译链路**：售后政策、商品知识、API 文档、ADR、研发规范等低频更新的结构化知识，在摄入时编译为 Wiki 页面，形成带 `[[wikilinks]]` 双向链接的知识图谱。
+- **实时数据走即时检索**：订单状态、物流信息、CI 日志等高频变动数据，保持传统 RAG 链路，不做预编译。
+- **知识编译不是一次性批处理**：采用增量编译机制（SHA256 变更检测），仅重处理发生变化的源文档，避免全量重建。
+- **编译结果可审计可纠错**：每篇 Wiki 页面记录来源文档、编译时间、版本号和置信状态；提供 Lint 机制检测死链、矛盾、过时内容和覆盖缺口。
+
+这一原则与"证据先于答案"（2.5）形成闭环：编译后的 Wiki 页面本身即带有完整引用链的结构化证据，查询时无需每次重新拼装。
+
 ---
 
 ## 3\. 总体架构
@@ -160,7 +173,7 @@ flowchart TB
     subgraph AGENT["RAG 与 Agent Runtime"]
         ROUTER["Domain Router<br/>售后 / 研发 / 通用"]
         QUERY["Query Understanding<br/>意图、实体、查询改写"]
-        RETRIEVAL["Retrieval Orchestrator<br/>多路召回、过滤、融合、重排"]
+        RETRIEVAL["Retrieval Orchestrator<br/>Wiki 图遍历 / 多路召回 / 过滤 / 融合 / 重排"]
         CONTEXT["Context Builder<br/>证据压缩、去重、引用"]
         LOOP["Bounded Agent Loop<br/>有限步骤、有限工具、停止条件"]
         WORKFLOW["Durable Workflow<br/>审批、重试、超时、补偿"]
@@ -169,18 +182,20 @@ flowchart TB
     end
 
     subgraph KNOWLEDGE["知识与索引层"]
+        WIKI["编译 Wiki 页面<br/>结构化 Markdown + [[wikilinks]] 图谱"]
         SEARCH["OpenSearch / Elasticsearch<br/>BM25 + Vector + Metadata"]
         VECTOR["独立向量库<br/>按规模可选 Milvus"]
         GRAPH["关系知识<br/>Neo4j，可选"]
         CACHE["Redis<br/>会话、热点、短期状态"]
-        META["PostgreSQL<br/>元数据、ACL、版本、任务状态"]
-        OBJECT["对象存储 / 湖仓<br/>原文、解析结果、历史版本"]
+        META["PostgreSQL<br/>元数据、ACL、版本、Wiki 编译状态、任务状态"]
+        OBJECT["对象存储 / 湖仓<br/>原文、Wiki 页面版本、解析结果、历史版本"]
     end
 
     subgraph PIPELINE["知识处理与治理层"]
         CONNECT["连接器与事件接入<br/>API / Webhook / CDC / Batch"]
         PARSE["文档解析<br/>版面、表格、OCR、代码块"]
         NORMALIZE["规范化<br/>去重、脱敏、分类、质量检查"]
+        COMPILE["知识编译<br/>Wikilink / Lint 健康检查"]
         CHUNK["结构化切分<br/>章节、语义、父子块"]
         EMBED["Embedding / Sparse Index / Rerank 数据准备"]
         ACL["ACL 与数据分级同步"]
@@ -208,6 +223,7 @@ flowchart TB
     POLICY --> ROUTER
     ROUTER --> QUERY
     QUERY --> RETRIEVAL
+    RETRIEVAL --> WIKI
     RETRIEVAL --> SEARCH
     RETRIEVAL --> VECTOR
     RETRIEVAL --> GRAPH
@@ -221,6 +237,8 @@ flowchart TB
     SOURCE --> CONNECT
     CONNECT --> PARSE
     PARSE --> NORMALIZE
+    PARSE --> COMPILE
+    COMPILE --> WIKI
     NORMALIZE --> CHUNK
     CHUNK --> EMBED
     ACL --> EMBED
@@ -228,6 +246,8 @@ flowchart TB
     VERSION --> SEARCH
     VERSION --> VECTOR
     NORMALIZE --> OBJECT
+    COMPILE --> OBJECT
+    WIKI --> META
     VERSION --> META
 
     TOOLREG --> S1
@@ -240,7 +260,8 @@ flowchart TB
     PROMPT -.-> AGENT
     EVAL -.-> AGENT
     AUDIT -.-> ACCESS
-    AUDIT -.-> KNOWLEDGE```
+    AUDIT -.-> KNOWLEDGE
+```
 
 
 
@@ -362,7 +383,59 @@ content
 
 不建议直接使用简单 PDF 文本提取后按固定字符数切分。
 
-### 4\.4 分块策略
+### 4.4 知识编译层（LLM Wiki 互补链路）
+
+传统 RAG 的知识组织方式是"源文档 → 分块 → Embedding → 索引"，查询时从块中即时检索。这种方式对实时数据和简单事实查询有效，但存在两个结构性缺陷：**知识不累积**（每次查询从零开始）和**结构不显式**（块之间关系仅靠向量相似度隐式表达）。
+
+引入 LLM Wiki 作为互补的知识编译层，采用"编译器"而非"解释器"模式处理稳定知识。
+
+**三层编译架构**（Andrej Karpathy 范式）：
+
+| 层 | 内容 | 读写权限 |
+|---|---|---|
+| Raw（原始文档） | PDF、Wiki、政策原文、API 文档等 | LLM 只读，不可修改 |
+| Wiki（编译输出） | 结构化 Markdown 页面，带 `[[wikilinks]]` 双向链接 | LLM 生成和维护，人类审核 |
+| Schema（规则层） | 页面类型、命名规范、链接规则、质量阈值 | 人类定义，与 Wiki 共同演化 |
+
+**三种核心操作**：
+
+1. **Ingest（增量摄入）**：
+   - 新文档放入 Raw 层后触发编译
+   - LLM 读取源文档 → 生成/更新 Wiki 页面 → 与已有页面建立 `[[wikilinks]]` → 更新索引目录 → 追加构建日志
+   - 核心机制："一个源文档进入，多个相关页面更新"——知识随摄入持续累积
+   - 增量检测：SHA256 哈希比对，仅重处理发生变化的源文档
+
+2. **Query（优先遍历）**：
+   - 优先读取 Wiki 索引目录定位相关页面 → 沿 `[[wikilinks]]` 图遍历 → 合成答案
+   - 仅在 Wiki 覆盖不足时回退到传统 Chunk 级检索
+   - 答案引用指向 Wiki 页面（页面本身已携带源文档引用链）
+
+3. **Lint（健康检查）**：
+   - **机械检查**：死链、孤立页面、索引漂移、重复标题、缺少元数据字段
+   - **语义检查（LLM 驱动）**：页面间矛盾、过时声明、覆盖缺口、跨引用缺失
+   - 矛盾不自动解决——标记后由人类裁决
+   - 可定期执行或作为 CI 门禁
+
+**与块级检索的分工**：
+
+| 维度 | 知识编译链路（LLM Wiki） | 块级检索链路（传统 RAG） |
+|---|---|---|
+| 适用知识 | 政策、API 文档、ADR、规范等稳定知识 | 订单状态、物流、CI 日志等实时数据 |
+| 更新频率 | 低频（按天/周） | 高频（实时/按分钟） |
+| 知识形态 | 结构化页面 + 双向链接图谱 | 扁平 Chunk + 向量索引 |
+| 查询方式 | Wiki 图遍历 + 页面检索 | BM25 + Dense Retrieval + Rerank |
+| 查询成本 | 低（预编译，查询时仅遍历） | 中（每次检索+重排+上下文构造） |
+| 累积效应 | 强（每次摄入丰富全局知识结构） | 弱（每次查询独立） |
+| 可审计性 | 强（页面级版本和引用链） | 中（块级溯源） |
+
+**企业场景的适用边界**：
+
+- **适合编译**：售后政策全集、商品知识库、API 参考文档、ADR 决策记录、研发规范、FAQ/SOP、故障知识库、产品手册
+- **不适合编译**：实时订单/物流状态、当前 CI 运行结果、实时监控告警、客服实时会话、动态工单流
+
+编译层的引入不替代现有块级检索管线。两者在检索时通过 Domain Router 统一调度：稳定知识查询优先走 Wiki 遍历 + 页面检索，实时数据查询走传统 Hybrid Search，必要时两者结果融合。
+
+### 4\.5 分块策略
 
 #### 售后文档
 
@@ -416,9 +489,9 @@ content
 
 代码本身不作为普通自然语言文档随意分块。代码搜索以精确搜索、符号和仓库元数据为主，语义检索只作为辅助。
 
-### 4\.5 检索流程
+### 4\.6 检索流程
 
-默认检索链路：
+默认检索链路（含 Wiki 图遍历）：
 
 ```Plaintext
 用户身份解析
@@ -426,9 +499,15 @@ content
 → 查询规范化
 → 实体和约束提取
 → ACL / Tenant / Metadata 过滤
-→ BM25 与 Dense Retrieval 并行
-→ RRF 或加权融合
-→ Reranker 精排
+→ 双路并行检索：
+│
+├─ Wiki 图谱路径（稳定知识优先）：
+│   Wiki Index 定位 → [[wikilinks]] 图遍历 → 编译页面检索
+│
+└─ 混合检索路径（实时数据 / 未覆盖知识）：
+    BM25 + Dense Retrieval 并行 → RRF 或加权融合 → Reranker 精排
+│
+→ 双路结果融合（Wiki 页面 + Chunk 结果去重合并）
 → 去重与父子块扩展
 → 证据充分性判断
 → 上下文构造
@@ -463,7 +542,7 @@ content
 
 5. 语义相似文档
 
-### 4\.6 PageIndex 的定位
+### 4\.7 PageIndex 的定位
 
 PageIndex 或文档树检索不作为企业全局主索引。
 
@@ -583,7 +662,8 @@ flowchart LR
     R --> RT1["文档与 API 检索"]
     R --> RT2["Git 元数据只读查询"]
     R --> RT3["Issue / CI 只读查询"]
-    R --> RT4["发布与故障知识检索"]```
+    R --> RT4["发布与故障知识检索"]
+```
 
 Master Router 尽量采用单次分类或短路由，不进行开放式长循环。
 
@@ -908,6 +988,7 @@ MCP 用于标准化以下能力：
 |模型网关|企业统一 Model Gateway|LiteLLM 类网关或自研|多模型路由、配额、降级|
 |私有模型推理|vLLM|KServe \+ vLLM、Triton|先简单服务，规模明确后平台化|
 |Trace 与评测|OpenTelemetry \+ MLflow|Phoenix、Langfuse|统一 Trace、评测和 Prompt 版本|
+|知识编译（Wiki）|llmwiki CLI / llm-wiki-compiler|WeKnora (Tencent)、自研薄层|增量编译、Wikilink 图谱、Lint 健康检查；可选引入|
 |部署|Kubernetes 或现有容器平台|VM 部署|根据现有基础设施决定|
 
 ### 7\.1 不推荐作为第一阶段默认组件
@@ -954,6 +1035,7 @@ MCP 用于标准化以下能力：
 + MLflow
 + 企业 IAM
 + 模型网关或 vLLM
++ LLM Wiki 编译工具（可选增量引入）
 ```
 
 该组合的主要特点：
@@ -969,6 +1051,8 @@ MCP 用于标准化以下能力：
 - 支持 Agent 工具调用
 
 - 支持人工审批
+
+- 支持知识增量编译与 Wiki 图谱（可选引入）
 
 - 支持完整审计
 
@@ -1128,6 +1212,17 @@ Request
 
 - 高风险动作拦截率
 
+#### Wiki 健康度（编译式知识库专用）
+
+- 死链数量与占比
+- 孤立页面（零入链）数量
+- 矛盾标记数（未解决/已解决）
+- 过期页面（`stale` 状态）占比
+- 覆盖缺口数（高频查询无对应 Wiki 页面）
+- 索引漂移（`index.md` 与实际页面清单不一致数）
+- 编译时效（源文档更新 → Wiki 页面更新的延迟）
+- 页面引用完整率（携带源文档引用链的页面占比）
+
 ### 10\.3 业务指标
 
 #### 售后
@@ -1180,6 +1275,8 @@ Request
 
 - 企业知识搜索门户
 
+- **稳定知识 Wiki 编译（可选增量引入）**：对售后政策、商品知识、API 文档等稳定知识启用编译链路，形成带 [[wikilinks]] 链接的结构化 Wiki；配置增量摄入和基础 Lint 检查
+
 退出条件：
 
 - 权限过滤无已知穿透
@@ -1187,6 +1284,8 @@ Request
 - 核心问题检索质量达到业务基线
 
 - 答案能够稳定返回来源和版本
+
+- （若启用 Wiki 编译）编译页面引用完整率 ≥ 95%，死链可自动检测并告警
 
 ### 阶段二：售后 Copilot
 
